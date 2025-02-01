@@ -169,7 +169,8 @@ TARS.wav
 /llm
 llm/
 vision/
-stt/
+stt/vosk-model-small-en-us-0.15/
+stt/vosk-model-small-en-us-0.15
 captured_image.jpg
 config.ini
 output.wav
@@ -177,3 +178,5 @@ output.wav
 /memory/initial_memory.loaded
 memory/initial_memory.json
 memory/initial_memory.loaded
+./tars.sh
+character/persona.ini
