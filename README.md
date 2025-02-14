@@ -118,7 +118,7 @@ For audio output, connect an I2S amplifier to the Raspberry Pi’s I2S (PCM) pin
 | VCC                | 3.3V (Pin 1 or 17)        | Power for the I2C logic.                          |
 
 **Note**: Ensure I2C is enabled on your Raspberry Pi using `raspi-config`. If you need help setting that up, let me know!
-
+**Note**: For a comprehensive layout of the Raspberry Pi 5’s GPIO pins, check out the detailed diagram here: [Raspberry Pi 5 GPIO Pinout](https://www.hackatronic.com/wp-content/uploads/2024/03/Raspberry-Pi-5-Pinout-.jpg)
 
 ## Touchscreen Calibration
 To calibrate the touchscreen, follow these steps:
