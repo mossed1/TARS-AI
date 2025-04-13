@@ -222,6 +222,45 @@ def raw_complete_llm(user_prompt, istext=True):
         queue_message(f"ERROR: LLM request failed: {e}")
         return None
 
+def raw_complete_llm_mcp(user_prompt, istext=True):
+    """
+    Generate a completion using the configured LLM backend.
+
+    Parameters:
+    - user_prompt (str or list): The user's input prompt, which can be either a string or a list of message dicts.
+    - istext (bool): Whether the prompt is a standard text query.
+
+    Returns:
+    - str: The generated completion.
+    """
+    # If user_prompt is a list of messages, convert it into a single string prompt.
+    if isinstance(user_prompt, list):
+        prompt_str = ""
+        for msg in user_prompt:
+            # Ensure that each message's "content" is a string.
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                content = str(content)
+            prompt_str += f"{msg.get('role')}: {content}\n"
+        user_prompt = prompt_str.strip()
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {CONFIG['LLM']['api_key']}"
+    }
+    llm_backend = CONFIG['LLM']['llm_backend']
+    url, data = _prepare_request_data(llm_backend, user_prompt)
+
+    try:
+        response = requests.post(url, headers=headers, json=data)
+        response.raise_for_status()
+        bot_reply = _extract_text(response.json(), istext)
+        return bot_reply
+    
+    except requests.RequestException as e:
+        queue_message(f"ERROR: LLM request failed: {e}")
+        return None
+
 # === Initialization ===
 def initialize_manager_llm(mem_manager, char_manager):
     """

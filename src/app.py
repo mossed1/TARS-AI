@@ -31,6 +31,7 @@ from modules.module_vision import initialize_blip
 from modules.module_llm import initialize_manager_llm
 from modules.module_ui import UIManager
 from modules.module_battery import BatteryModule
+from modules.module_mcpServers import initservers
 import modules.module_chatui
 
 import logging  # This will hide INFO and DEBUG messages
@@ -44,7 +45,7 @@ sys.path.insert(0, BASE_DIR)
 sys.path.append(os.getcwd())
 
 CONFIG = load_config()
-VERSION = "3.0 Dev Beta 0.1"
+VERSION = "3.0 Dev Beta 0.4"
 
 # === Helper Functions ===
 def init_app():
@@ -72,6 +73,10 @@ def start_discord_in_thread():
 if __name__ == "__main__":
     # Perform initial setup
     init_app()
+
+    #mcpservers_thread = threading.Thread(target=initservers, daemon=True)
+    #mcpservers_thread.start()
+    #queue_message("INFO: MCP Servers started in a separate thread.")
 
     # Create a shutdown event for global threads
     shutdown_event = threading.Event()
@@ -119,7 +124,6 @@ if __name__ == "__main__":
     if CONFIG['VISION']['enabled'] == "True" and CONFIG['VISION']['server_hosted'] != "True":
         initialize_blip()
 
-    
     try:
         queue_message(f"LOAD: TARS-AI v"+VERSION+" running.")        
         ui_manager.update_data("System", "LOAD: TARS-AI v"+VERSION+" running.", "SYSTEM")

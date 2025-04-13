@@ -1,541 +1,328 @@
-"""
-module_engine.py
-
-Core module for TARS-AI responsible for:
-- Predicting user intents and determining required modules.
-- Executing tool-specific functions like web searches, vision analysis, and volume control.
-
-This is achieved using a pre-trained Naive Bayes classifier and TF-IDF vectorizer.
-"""
-# MIT License
-# 
-# Copyright (c)
-# 
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-# 
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-# 
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-# THE SOFTWARE.
-
-# === Standard Libraries ===
-import os
-import joblib
-from datetime import datetime
-import threading
+import asyncio
 import json
-import re
+import os
+import shutil
+from typing import Dict, List, Optional, Any
+from contextlib import suppress
 
-# === Custom Modules ===
-from modules.module_websearch import search_google, search_google_news
-from modules.module_vision import describe_camera_view
-from modules.module_stablediffusion import generate_image
-from modules.module_volume import handle_volume_command
-from modules.module_homeassistant import send_prompt_to_homeassistant
-from modules.module_tts import generate_tts_audio
-from modules.module_config import load_config, update_character_setting
-from modules.module_messageQue import queue_message
+import requests
+from dotenv import load_dotenv
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
-# === Constants ===
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # Move up to "src"
-MODEL_FILENAME = os.path.join(BASE_DIR, 'engine/pickles/naive_bayes_model.pkl')
-VECTORIZER_FILENAME = os.path.join(BASE_DIR, 'engine/pickles/module_engine_model.pkl')
-TRAINING_DATA_PATH = os.path.join(BASE_DIR, 'engine/training/training_data.csv')
 
-CONFIG = load_config()
+class Configuration:
+    """Manages configuration and environment variables for the MCP client."""
+    def __init__(self) -> None:
+        self.load_env()
+        self.api_key = os.getenv("GROQ_API_KEY")
+        # self.api_key = os.getenv("GITHUB_API_KEY")
 
-# === Load Models ===
-try:
-    if not os.path.exists(VECTORIZER_FILENAME):
-        raise FileNotFoundError("Vectorizer file not found.")
-    if not os.path.exists(MODEL_FILENAME):
-        raise FileNotFoundError("Model file not found.")
-    nb_classifier = joblib.load(MODEL_FILENAME)
-    tfidf_vectorizer = joblib.load(VECTORIZER_FILENAME)
+    @staticmethod
+    def load_env() -> None:
+        load_dotenv()
 
-except FileNotFoundError as e:
-    # Attempt to train models if files are missing
-    import module_engineTrainer
-    module_engineTrainer.train_text_classifier()
-    try:
-        nb_classifier = joblib.load(MODEL_FILENAME)
-        tfidf_vectorizer = joblib.load(VECTORIZER_FILENAME)
-    except Exception as retry_exception:
-        raise RuntimeError("Critical error while loading models.") from retry_exception
+    @staticmethod
+    def load_config(file_path: str) -> Dict[str, Any]:
+        with open(file_path, 'r') as f:
+            return json.load(f)
 
-# === Functions ===
-def execute_movement(movement, times):
-    """
-    Executes the specified movement in a separate thread.
-    """
-    def movement_task():
-        queue_message(f"[DEBUG] Thread started for movement: {movement} x {times}")
-        from module_btcontroller import turnRight, turnLeft, poseaction, unposeaction, stepForward
-        
-        action_map = {
-            "turnRight": turnRight,
-            "turnLeft": turnLeft,
-            "poseaction": poseaction,
-            "unposeaction": unposeaction,
-            "stepForward": stepForward,
-        }
-        
+    @property
+    def llm_api_key(self) -> str:
+        # For this refactoring, we simply return a fixed value.
+        return "xyz"
+
+
+class Server:
+    """Manages MCP server connections and tool execution."""
+    def __init__(self, name: str, config: Dict[str, Any]) -> None:
+        self.name: str = name
+        self.config: Dict[str, Any] = config
+        self.stdio_context: Optional[Any] = None
+        self.session: Optional[ClientSession] = None
+        self._cleanup_lock: asyncio.Lock = asyncio.Lock()
+        self.capabilities: Optional[Dict[str, Any]] = None
+
+    async def initialize(self) -> None:
+        server_params = StdioServerParameters(
+            command=shutil.which("npx") if self.config['command'] == "npx" else self.config['command'],
+            args=self.config['args'],
+            env={**os.environ, **self.config['env']} if self.config.get('env') else None
+        )
         try:
-            action_function = action_map.get(movement)
-            if callable(action_function):
-                for i in range(int(times)):
-                    queue_message(f"[DEBUG] Executing {movement}, iteration {i + 1}/{times}")
-                    action_function()  # Blocking for this thread
-            else:
-                queue_message(f"[ERROR] Movement '{movement}' not found in action_map.")
+            self.stdio_context = stdio_client(server_params)
+            read, write = await self.stdio_context.__aenter__()
+            self.session = ClientSession(read, write)
+            await self.session.__aenter__()
+            self.capabilities = await self.session.initialize()
         except Exception as e:
-            queue_message(f"[ERROR] Unexpected error while executing movement: {e}")
-        finally:
-            queue_message(f"[DEBUG] Thread completed for movement: {movement} x {times}")
+            print(f"Error initializing server {self.name}: {e}")
+            await self.cleanup()
+            raise
 
-    # Start the thread
-    thread = threading.Thread(target=movement_task, daemon=True)
-    thread.start()
-    return thread  # Return the thread object if needed
+    async def list_tools(self) -> List[Any]:
+        if not self.session:
+            raise RuntimeError(f"Server {self.name} not initialized")
+        tools_response = await self.session.list_tools()
+        tools = []
+        supports_progress = self.capabilities and 'progress' in self.capabilities
+        if supports_progress:
+            print(f"Server {self.name} supports progress tracking")
+        for item in tools_response:
+            if isinstance(item, tuple) and item[0] == 'tools':
+                for tool in item[1]:
+                    tools.append(Tool(tool.name, tool.description, tool.inputSchema))
+                    if supports_progress:
+                        print(f"Tool '{tool.name}' will support progress tracking")
+        return tools
 
-def movement_llmcall(user_input):
+    async def execute_tool(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        retries: int = 2,
+        delay: float = 1.0
+    ) -> Any:
+        if not self.session:
+            raise RuntimeError(f"Server {self.name} not initialized")
 
-    if CONFIG['CONTROLS']['voicemovement'] != "True":
-        return
-    
-    """
-    Interpret and execute movement commands based on user input using an LLM.
+        attempt = 0
+        while attempt < retries:
+            try:
+                supports_progress = self.capabilities and 'progress' in self.capabilities
+                if supports_progress:
+                    print(f"Executing {tool_name} with progress tracking...")
+                    result = await self.session.call_tool(
+                        tool_name,
+                        arguments,
+                        progress_token=f"{tool_name}_execution"
+                    )
+                else:
+                    print(f"Executing {tool_name}...")
+                    result = await self.session.call_tool(tool_name, arguments)
+                return result
 
-    Parameters:
-    - user_input (str): The natural language command describing the desired movement (e.g., "turn right 90 degrees" or "step forward 3 times").
+            except Exception as e:
+                attempt += 1
+                print(f"Error executing tool: {e}. Attempt {attempt} of {retries}.")
+                if attempt < retries:
+                    print(f"Retrying in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                else:
+                    print("Max retries reached. Failing.")
+                    raise
 
-    Returns:
-    - bool: True if the movement command was successfully interpreted and executed, False otherwise.
-    - str: Error message if the command could not be processed.
-    """
-    from module_llm import raw_complete_llm
-    # Define the prompt with placeholders
-    prompt = f"""
-    You are TARS, an AI module responsible for interpreting movement commands. Your job is to:
+    async def cleanup(self) -> None:
+        async with self._cleanup_lock:
+            # Cleanup session
+            if self.session:
+                with suppress(asyncio.CancelledError):
+                    try:
+                        await self.session.__aexit__(None, None, None)
+                    except Exception as e:
+                        print(f"Warning during session cleanup for {self.name}: {e}")
+                self.session = None
 
-    1. Determine the type of movement from the following options only:
-    - stepForward
-    - turnRight
-    - turnLeft
-    - poseaction
-    - unposeaction
-    2. Extract the number of steps or the angle of turn if applicable, where 180 degrees equals 2 steps (90 degrees = 1 step).
-    3. Respond with a structured JSON output in the exact format:
-    {{
-        "movement": "{{
-            "movement": "<MOVEMENT>",
-            "times": <TIMES>
-        }}
-    }}
+            # Cleanup stdio context
+            if self.stdio_context:
+                with suppress(asyncio.CancelledError):
+                    try:
+                        await self.stdio_context.__aexit__(None, None, None)
+                    except (RuntimeError, asyncio.CancelledError) as e:
+                        print(f"Note: Normal shutdown message for {self.name}: {e}")
+                    except Exception as e:
+                        print(f"Warning during stdio cleanup for {self.name}: {e}")
+                self.stdio_context = None
 
-    Rules:
-    - Always output a single JSON object with the fields "movement" and "times".
-    - Do not output explanations, variations, or multiple commands.
-    - If no steps or angle is specified, default "times" to 1.
-    - Use precise logic for angles:
-    - Convert 90 degrees = 1 step.
-    - For angles greater than 90, calculate the number of steps (e.g., 180 degrees = 2 steps, 360 degrees = 4 steps).
-    - Determine the turn direction (turnLeft or turnRight) based on the input.
 
-    Examples:
-    Input: "Hey TARS, walk forward 3 times"
-    Output:
-    {{
-        "movement": "stepForward",
-        "times": 3
-    }}
+class Tool:
+    """Represents a tool with its properties and formatting."""
+    def __init__(self, name: str, description: str, input_schema: Dict[str, Any]) -> None:
+        self.name: str = name
+        self.description: str = description
+        self.input_schema: Dict[str, Any] = input_schema
 
-    Input: "Hey TARS, do a 180-degree turn"
-    Output:
-    {{
-        "movement": "turnLeft",
-        "times": 2
-    }}
+    def format_for_llm(self) -> str:
+        args_desc = []
+        if 'properties' in self.input_schema:
+            for param_name, param_info in self.input_schema['properties'].items():
+                arg_desc = f"- {param_name}: {param_info.get('description', 'No description')}"
+                if param_name in self.input_schema.get('required', []):
+                    arg_desc += " (required)"
+                args_desc.append(arg_desc)
+        return f"""
+Tool: {self.name}
+Description: {self.description}
+Arguments:
+{chr(10).join(args_desc)}
+"""
 
-    Input: "Hey TARS, turn right twice"
-    Output:
-    {{
-        "movement": "turnRight",
-        "times": 2
-    }}
 
-    Input: "Hey TARS, pose"
-    Output:
-    {{
-        "movement": "poseaction",
-        "times": 1
-    }}
+class LLMClient:
+    """Manages communication with the LLM provider."""
+    def __init__(self, api_key: str) -> None:
+        self.api_key: str = api_key
 
-    Input: "Hey TARS, unpose"
-    Output:
-    {{
-        "movement": "unposeaction",
-        "times": 1
-    }}
-
-    Instructions:
-    - Use only the specified movements (stepForward, turnRight, turnLeft, poseaction, unposeaction).
-    - Ensure the JSON output is properly formatted and follows the example structure exactly.
-    - Process the input as a single command and provide one-line JSON output.
-
-    Input: "{user_input}"
-    Output:
-    """
-    try:
-        data = raw_complete_llm(prompt)
-
-        import json
-        # Parse the JSON response
-        extracted_data = json.loads(data)
-
-        # Extract movement and times
-        movement = extracted_data.get("movement")
-        times = extracted_data.get("times")
-
-        queue_message(f"[DEBUG] FunctionCalling: {data}")
-        queue_message(f"[DEBUG] Extracted values: {movement}, {times}")
-
-        # Validate the extracted data
-        if movement and times:
-            if isinstance(movement, str) and isinstance(times, int):
-                queue_message("moving")
-                execute_movement(movement, times)  # Call the movement function with validated values
-                return True
-            else:
-                queue_message("[ERROR] Invalid types: 'movement' must be str and 'times' must be int.")
-                return False
-        else:
-            queue_message("[ERROR] Missing 'movement' or 'times' in the response.")
-            return False
-    
-    except Exception as e:
-        #queue_message(f"[DEBUG] Error in movement_llmcall: {e}")
-        return f"Error processing the movement command: {e}"
-
-def call_function(module_name, *args, **kwargs):
-    #queue_message(f"[DEBUG] Calling module: {module_name}")
-    if module_name not in FUNCTION_REGISTRY:
-        #queue_message(f"[DEBUG] No function registered for module: {module_name}")
-        return "Not a Function"
-    func = FUNCTION_REGISTRY[module_name]
-    try:
-        # Check if the function requires arguments
-        if func.__code__.co_argcount == 0:  # No arguments expected
-            return func()
-        else:  # Pass arguments if required
-            return func(*args, **kwargs)
-    except Exception as e:
-        queue_message(f"[DEBUG] Error while executing {module_name}: {e}")
-
-def check_for_module(user_input):
-    """
-    Determines the appropriate module to handle the user's input and invokes it.
-    """
-    predicted_class, probability = predict_class(user_input)
-    if not predicted_class:
-        return "None"
-    
-    # Call the function associated with the predicted class
-    return call_function(predicted_class, user_input)
-
-def predict_class(user_input):
-    """
-    Which method to use for function calling NB (single LLM CALL) or LLM (Multiple LLM Calls)
-    """
-    if CONFIG['LLM']['functioncalling'] == 'NB':
-        return predict_class_nb(user_input)
-    else:
-        return predict_class_llm(user_input)
-    return
-
-def predict_class_nb(user_input):
-    """
-    Predicts the class and its confidence score for a given user input.
-
-    Parameters:
-        user_input (str): The input text from the user.
-
-    Returns:
-        tuple: Predicted class and its probability score.
-    """
-    query_vector = tfidf_vectorizer.transform([user_input])
-    predictions = nb_classifier.predict(query_vector)
-    predicted_probabilities = nb_classifier.predict_proba(query_vector)
-
-    predicted_class = predictions[0]
-    max_probability = max(predicted_probabilities[0])
-    # Return None if confidence is below threshold
-
-    #queue_message(f"TOOL: Using Tool {predicted_class} ({max_probability})")
-
-    if max_probability < 0.75:
-        return None, max_probability
-
-    # Format the value as a percentage with 2 decimal places
-    formatted_probability = "{:.2f}%".format(max_probability * 100)
-    queue_message(f"TOOL: Using Tool {predicted_class} ({formatted_probability})")
-    generate_tts_audio("processing, processing, processing", CONFIG['TTS']['ttsoption'], CONFIG['TTS']['azure_api_key'], CONFIG['TTS']['azure_region'], CONFIG['TTS']['ttsurl'], CONFIG['TTS']['toggle_charvoice'], CONFIG['TTS']['tts_voice'])
-
-    return predicted_class, max_probability
-
-def predict_class_llm(user_input):
-    from module_llm import raw_complete_llm
-
-    prompt = f"""
-    You are an AI module tasked with predicting the appropriate tool usage based on the user's message, with a high level of accuracy and understanding of the intent behind their words. The available tools and their descriptions are as follows: {FUNCTION_REGISTRY}.
-
-    Your tasks are:
-
-    1. Determine if a tool should be used based on the user's message or if the user is simply chatting. If no tool is needed, the response should default to "chat".
-    
-    2. Identify the specific tool being referenced from the available list of tools and their descriptions. It is crucial to recognize when the user is just having a casual conversation and does not require any tool. In such cases, use "chat" as the tool.
-
-    3. Extract the confidence level for the predicted tool usage based on the user's message. Ensure the confidence is a valid percentage (0–100).
-
-    4. Respond with a structured JSON output in the following format:
-    {{
-        "functioncall": {{
-            "tool": "<TOOL>",
-            "confidence": <CONFIDENCE>
-        }}
-    }}
-
-    Rules:
-    - Always output a single JSON object containing "tool" and "confidence".
-    - If no confidence is provided, or if the tool is not explicitly referenced, set the confidence to 0.
-    - If no tool is needed or the user is just chatting, set the "tool" to "chat" with a confidence of 0.
-    - Ensure that the tool name exactly matches one from the available options, or default to "chat" if no tool is needed.
-    - Do not include any explanations, variations, or additional data in the output.
-
-    Instructions:
-    - Match the appropriate tool to the intent of the user's input based on the provided descriptions.
-    - Consider context carefully—if the input is a simple greeting or chat, do not suggest any tools.
-    - Only use tools from the provided list and avoid making assumptions about the user's intent.
-
-    Input: "{user_input}"
-    Output:
-    """
-
-    try:
-        # Get the raw response from the LLM
-        data = raw_complete_llm(prompt)
-        #queue_message(f"[DEBUG] Raw LLM response: {repr(data)}")  # Show exact response
-
-        # Strip out the markdown block (```) from the raw response
-        data = re.sub(r'```json\n|\n```', '', data).strip()
-
-        # Parse the response
-        predicted_class = None
-        confidence = None
-
-        # Try JSON parsing first
+    def get_response(self, messages: List[Dict[str, str]]) -> str:
+        url = "http://192.168.2.57:1234/v1/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        payload = {
+            "messages": messages,
+            "model": "llama-3.2-90b-vision-preview",
+            "temperature": 0.7,
+            "max_tokens": 4096,
+            "top_p": 1,
+            "stream": False,
+            "stop": None
+        }
         try:
-            parsed_data = json.loads(data)  # Strip whitespace/newlines
-            #queue_message(f"[DEBUG] Parsed JSON: {parsed_data}")
-            function_call = parsed_data.get("functioncall")
-            if function_call and "tool" in function_call and "confidence" in function_call:
-                predicted_class = function_call["tool"]
-                confidence = function_call["confidence"]
-            else:
-                #queue_message("[ERROR] Invalid JSON structure: missing required fields.")
-                return None, 0.0
-        except json.JSONDecodeError as e:
-            #queue_message(f"[DEBUG] JSON parsing failed: {str(e)}")
-            # Fallback to string parsing
-            match = re.search(r'Tool:\s*(\w+),\s*Confidence:\s*(\d+)%', data)
-            if match:
-                predicted_class = match.group(1)
-                confidence = int(match.group(2))
-            else:
-                #queue_message("[ERROR] Failed to extract tool and confidence from response.")
-                return None, 0.0
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            return data['choices'][0]['message']['content']
+        except requests.exceptions.RequestException as e:
+            error_message = f"Error getting LLM response: {str(e)}"
+            print(error_message)
+            if e.response is not None:
+                print(f"Status code: {e.response.status_code}")
+                print(f"Response details: {e.response.text}")
+            return f"I encountered an error: {error_message}. Please try again or rephrase your request."
 
-        # Validate extracted values
-        if not predicted_class or not isinstance(confidence, (int, float)):
-            #queue_message("[ERROR] Extracted tool or confidence is invalid.")
-            return None, 0.0
 
-        #queue_message(f"[DEBUG] Extracted values: tool={predicted_class}, confidence={confidence}")
+class ChatSession:
+    """Orchestrates the interaction between user, LLM, and tools."""
+    def __init__(self, servers: List[Server], llm_client: LLMClient) -> None:
+        self.servers: List[Server] = servers
+        self.llm_client: LLMClient = llm_client
 
-        if predicted_class not in FUNCTION_REGISTRY:
-            #queue_message("[ERROR] Tool not recognized.")
-            return None, 0.0
+    async def cleanup_servers(self) -> None:
+        cleanup_tasks = [asyncio.create_task(server.cleanup()) for server in self.servers]
+        if cleanup_tasks:
+            try:
+                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"Warning during final cleanup: {e}")
 
-        if confidence < 0 or confidence > 100:
-            #queue_message("[ERROR] Confidence out of bounds. Setting to 50%.")
-            confidence = 50.0
+    async def process_llm_response(self, llm_response: str) -> str:
+        """
+        If the LLM response is a tool call, execute it and return its output.
+        If the response isn’t a tool call, simply return the original response.
+        """
+        try:
+            tool_call = json.loads(llm_response)
+            if "tool" in tool_call and "arguments" in tool_call:
+                print(f"Executing tool: {tool_call['tool']}")
+                print(f"With arguments: {tool_call['arguments']}")
+                for server in self.servers:
+                    tools = await server.list_tools()
+                    if any(tool.name == tool_call["tool"] for tool in tools):
+                        try:
+                            result = await server.execute_tool(tool_call["tool"], tool_call["arguments"])
+                            if isinstance(result, dict) and 'progress' in result and 'total' in result:
+                                progress = result['progress']
+                                total = result['total']
+                                print(f"Progress: {progress}/{total} ({(progress/total)*100:.1f}%)")
+                            return f"Tool execution result: {result}"
+                        except Exception as e:
+                            error_msg = f"Error executing tool: {str(e)}"
+                            print(error_msg)
+                            return error_msg
+                return f"No server found with tool: {tool_call['tool']}"
+            return llm_response
+        except json.JSONDecodeError:
+            return llm_response
 
-        # Normalize confidence to 0–1
-        max_probability = confidence / 100.0
 
-        if max_probability < 0.75:
-            #queue_message(f"[INFO] Confidence too low ({max_probability:.2f}). Tool not used.")
-            return None, max_probability
-
-        formatted_probability = f"{max_probability * 100:.2f}%"
-        queue_message(f"TOOL: Using Tool {predicted_class} ({formatted_probability})")
-        generate_tts_audio("processing, processing, processing", CONFIG['TTS']['ttsoption'], CONFIG['TTS']['azure_api_key'], CONFIG['TTS']['azure_region'], CONFIG['TTS']['ttsurl'], CONFIG['TTS']['toggle_charvoice'], CONFIG['TTS']['tts_voice'])
-
-        return predicted_class, max_probability
-
-    except Exception as e:
-        queue_message(f"[ERROR] Unexpected error: {str(e)}")
-        return None, 0.0
-
-def adjust_persona(user_input):
+async def process_user_prompt(user_prompt: str) -> Optional[str]:
     """
-    Adjust the personality traits of TARS, such as humor, empathy, or formality.
-
-    Parameters:
-    - user_input (str): The natural language command specifying the trait and its new value (e.g., "Set humor to 75%").
-
-    Returns:
-    - str: A confirmation message indicating the updated trait and value, or an error message if the input is invalid.
-    """
-
-    from module_llm import raw_complete_llm
-    # Define the prompt with placeholders
-    prompt = f"""
-    You are TARS, an AI module responsible for extracting personality trait adjustments. Your job is to:
-
-    1. Identify the personality trait being adjusted from the following options only:
-    - honesty
-    - humor
-    - empathy
-    - curiosity
-    - confidence
-    - formality
-    - sarcasm
-    - adaptability
-    - discipline
-    - imagination
-    - emotional_stability
-    - pragmatism
-    - optimism
-    - resourcefulness
-    - cheerfulness
-    - engagement
-    - respectfulness
-
-    2. Extract the value being assigned to the personality trait, ensuring it is a valid percentage (0–100).
-
-    3. Respond with a structured JSON output in the exact format:
-    {{
-        "persona": {{
-            "trait": "<TRAIT>",
-            "value": <VALUE>
-        }}
-    }}
-
-    Rules:
-    - Always output a single JSON object with the fields "trait" and "value".
-    - Do not output explanations, variations, or multiple commands.
-    - If the value is not specified, respond with:
-    {{"error": "Value not provided"}}
-    - Ensure the trait matches one of the listed options exactly.
-
-    Examples:
-    Input: "TARS, adjust your humor setting to 69%"
-    Output:
-    {{
-        "persona": {{
-            "trait": "humor",
-            "value": 69
-        }}
-    }}
-
-    Input: "Increase empathy to 60%, TARS."
-    Output:
-    {{
-        "persona": {{
-            "trait": "empathy",
-            "value": 60
-        }}
-    }}
-
-    Input: "TARS, can you be more respectful?"
-    Output:
-    {{
-        "persona": {{
-            "trait": "respectfulness",
-            "value": 60
-        }}
-    }}
-
-    Input: "TARS, set curiosity higher."
-    Output:
-    {{
-        "error": "Value not provided"
-    }}
-
-    Instructions:
-    - Use only the specified traits (honesty, humor, empathy, etc.).
-    - Ensure the JSON output is properly formatted and follows the example structure exactly.
-    - Process the input as a single command and provide a one-line JSON output.
-
-    Input: "{user_input}"
-    Output:
-    """
-
-    try:
-        data = raw_complete_llm(prompt)
-
-        # Strip out the markdown block (```json) and newlines, then parse the JSON response
-        data = re.sub(r'```json\n|\n```', '', data).strip()
-
-        # Parse the JSON response
-        extracted_data = json.loads(data)
-
-        # Access the "persona" object
-        persona_data = extracted_data.get("persona", {})
-        trait = persona_data.get("trait")
-        value = persona_data.get("value")
-
-        #queue_message(f"[DEBUG] FunctionCalling: {data}")
-        #queue_message(f"[DEBUG] Extracted values: {trait}, {value}")
-
-        # Validate the extracted data
-        if trait and value:
-            if isinstance(trait, str) and isinstance(value, int):
-                queue_message(f"INFO: Saving {trait}, {value}")
-                update_character_setting(trait, value)
-                return f"Updated {trait} setting to {value}"
-            else:
-                #queue_message("[ERROR] Invalid types")
-                return False
-        else:
-            #queue_message("[ERROR] Missing in the response.")
-            return False
+    Process a single user prompt.
     
-    except Exception as e:
-        return f"Error processing the movement command: {e}"
+    This function sets up the servers, initializes the LLM client, and sends the
+    user prompt along with a system message containing tool descriptions.
+    
+    If the LLM response indicates that a tool should be called, the tool is executed
+    and its output is returned. If no tool is needed (i.e. the LLM response isn’t a
+    valid tool call), the function returns None.
+    """
+    # Load configuration
+    config = Configuration()
+    config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config-MCP.json')
+    server_config = config.load_config(config_path)
 
- 
-# === Function Calling ===
-FUNCTION_REGISTRY = {
-    "Weather": search_google, 
-    "News": search_google_news,
-    "Move": movement_llmcall,
-    "Vision": describe_camera_view,
-    "Search": search_google,
-    "SDmodule-Generate": generate_image,
-    "Volume": handle_volume_command,
-    "Persona": adjust_persona,
-    "Home_Assistant": send_prompt_to_homeassistant
-}
+    # Initialize servers
+    servers = [Server(name, srv_config) for name, srv_config in server_config['mcpServers'].items()]
+    for server in servers:
+        try:
+            await server.initialize()
+        except Exception as e:
+            print(f"Failed to initialize server {server.name}: {e}")
+            await asyncio.gather(*(s.cleanup() for s in servers), return_exceptions=True)
+            return None
+
+    # Prepare system message with tool descriptions
+    all_tools = []
+    for server in servers:
+        tools = await server.list_tools()
+        all_tools.extend(tools)
+    tools_description = "\n".join([tool.format_for_llm() for tool in all_tools])
+    system_message = f"""You are a helpful assistant with access to these tools: 
+
+{tools_description}
+Choose the appropriate tool based on the user's question. If no tool is needed, reply directly.
+
+IMPORTANT: When you need to use a tool, you must ONLY respond with the exact JSON object format below, nothing else:
+{{
+    "tool": "tool-name",
+    "arguments": {{
+        "argument-name": "value"
+    }}
+}}
+
+After receiving a tool's response:
+1. Transform the raw data into a natural, conversational response
+2. Keep responses concise but informative
+3. Focus on the most relevant information
+4. Use appropriate context from the user's question
+5. Avoid simply repeating the raw data
+
+Please use only the tools that are explicitly defined above."""
+    messages = [
+        {"role": "system", "content": system_message},
+        {"role": "user", "content": user_prompt}
+    ]
+    llm_response = config.llm_api_key and LLMClient(config.llm_api_key).get_response(messages) or ""
+    
+    chat_session = ChatSession(servers, LLMClient(config.llm_api_key))
+    tool_result = await chat_session.process_llm_response(llm_response)
+
+    await chat_session.cleanup_servers()
+
+    if tool_result != llm_response:
+        return tool_result
+    return None
+
+
+async def main() -> None:
+    prompt = input("Enter your prompt: ").strip()
+    result = await process_user_prompt(prompt)
+    if result is not None:
+        print("\nTool call output:")
+        print(result)
+    else:
+        print("\nNo tool call was needed; returning None.")
+
+
+if __name__ == "__main__":
+    # Run the main coroutine and then shut down async generators explicitly.
+    try:
+        asyncio.run(main())
+    finally:
+        # Ensure async generators are properly shut down to avoid errors on loop close.
+        with suppress(Exception):
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(loop.shutdown_asyncgens())
