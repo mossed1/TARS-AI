@@ -86,7 +86,7 @@ def initservers():
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config_path = os.path.join(base_dir, 'config-MCP.json')
     config = load_config(config_path)
-    print("Loaded configuration:", config)
+    print("Loaded configuration: ", config)
 
     # Launch each MCP server defined in the configuration.
     processes = {}

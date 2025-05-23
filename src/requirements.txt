@@ -65,3 +65,4 @@ lgpio                           # Required for Raspberry pi 5 users
 # MCP
 
 duckduckgo-mcp-server
+pydantic-ai-slim[mcp] #MAYBE....

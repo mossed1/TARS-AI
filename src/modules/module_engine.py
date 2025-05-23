@@ -12,7 +12,7 @@ from mcp.client.stdio import stdio_client
 
 
 class Configuration:
-    """Manages configuration and environment variables for the MCP client."""
+    """Manages configuration and environment variables for the MCP client. """
     def __init__(self) -> None:
         self.load_env()
         self.api_key = os.getenv("GROQ_API_KEY")
@@ -164,7 +164,7 @@ class LLMClient:
         self.api_key: str = api_key
 
     def get_response(self, messages: List[Dict[str, str]]) -> str:
-        url = "http://192.168.2.57:1234/v1/chat/completions"
+        url = "http://192.168.2.59:1234/v1/chat/completions"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}"

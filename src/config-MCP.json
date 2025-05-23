@@ -2,15 +2,22 @@
   "mcpServers": {
     "playwright": {
       "command": "npx",
-      "args": [
-        "@executeautomation/playwright-mcp-server"
-      ]
+      "args": ["-y", "@executeautomation/playwright-mcp-server", "--port", "9001", "--headless"]
     },
     "duckduckgo-search": {
       "command": "npx",
       "args": [
         "-y",
         "duckduckgo-mpc-server"
+      ]
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/home/pyrater/Desktop",
+        "/home/pyrater"
       ]
     }
   }

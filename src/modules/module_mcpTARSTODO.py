@@ -3,7 +3,7 @@ from modules.module_vision import describe_camera_view
 from modules.module_stablediffusion import generate_image
 from modules.module_volume import handle_volume_command
 from modules.module_homeassistant import send_prompt_to_homeassistant
-
+ 
 def adjust_persona(user_input: str) -> str:
     """
     Adjusts personality settings based on a natural language command.

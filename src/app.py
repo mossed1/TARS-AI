@@ -74,9 +74,9 @@ if __name__ == "__main__":
     # Perform initial setup
     init_app()
 
-    #mcpservers_thread = threading.Thread(target=initservers, daemon=True)
-    #mcpservers_thread.start()
-    #queue_message("INFO: MCP Servers started in a separate thread.")
+    mcpservers_thread = threading.Thread(target=initservers, daemon=True)
+    mcpservers_thread.start()
+    queue_message("INFO: MCP Servers started in a separate thread.")
 
     # Create a shutdown event for global threads
     shutdown_event = threading.Event()

@@ -20,7 +20,7 @@ config = load_config()
 
 def generate_image(prompt: str) -> str:
     """
-    Generate an image based on the provided prompt using the configured image generation service.
+    Generate an image based on the provided prompt using the configured image generation service. 
     Returns a status message.
     """
     result = "Image Tool not enabled"
